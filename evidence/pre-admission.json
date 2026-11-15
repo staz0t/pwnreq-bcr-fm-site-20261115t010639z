@@ -1,0 +1,10 @@
+{
+  "output_bases_already_warmed": [
+    "attack",
+    "control"
+  ],
+  "target_repository": "github.com_arnodorian1337_pwnreq-bcr-fm-src-20261115t010639z_releases_download_v1.0.0_proof.binaryprotos",
+  "target_repository_absent_before_admission": true,
+  "warm_repository": "github.com_arnodorian1337_pwnreq-bcr-fm-src-20261115t010639z_releases_download_v1.0.0_unrelated.binaryprotos",
+  "warm_unrelated_repository_materialized_first": true
+}

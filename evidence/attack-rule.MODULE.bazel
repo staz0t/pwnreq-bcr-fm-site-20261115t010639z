@@ -1,0 +1,5 @@
+http_archive(
+    name = "github.com_arnodorian1337_pwnreq-bcr-fm-src-20261115t010639z_releases_download_v1.0.0_proof.binaryprotos",
+    build_file_content = "filegroup(name = \"files\",\n    srcs = glob([\"**/*.binaryproto\"]),\n    visibility = [\"//visibility:public\"],\n)",
+    url = "https://github.com/arnodorian1337/pwnreq-bcr-fm-src-20261115t010639z/releases/download/v1.0.0/proof.docs.tar.gz",
+)
