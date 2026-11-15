@@ -1,0 +1,9 @@
+load(":proof_compile.bzl", "published_docs_compile")
+
+exports_files(["stardoccompiler-bin"])
+
+published_docs_compile(
+    name = "compile",
+    compiler = ":stardoccompiler-bin",
+    srcs = ["__TARGET_LABEL__"],
+)

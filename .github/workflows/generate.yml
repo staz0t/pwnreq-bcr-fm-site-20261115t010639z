@@ -1,0 +1,217 @@
+name: Generate first-deploy published documentation
+on:
+  repository_dispatch:
+    types: [on-registry-trigger]
+permissions:
+  contents: write
+jobs:
+  generate-site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+      - name: Bind the exact dispatch and newly merged docs_url
+        env:
+          REGISTRY_REPO: ${{ github.event.client_payload.registryRepo }}
+          REGISTRY_COMMIT: ${{ github.event.client_payload.registryCommit }}
+          REVIEWED_HEAD: ${{ github.event.client_payload.reviewedHead }}
+          REVIEWED_PR: ${{ github.event.client_payload.reviewedPullRequest }}
+          REVIEWED_SHA: ${{ github.event.client_payload.reviewedDocsSHA256 }}
+        run: |
+          set -euo pipefail
+          test -n "$REGISTRY_REPO"
+          test "${#REGISTRY_COMMIT}" -eq 40
+          test "${#REVIEWED_HEAD}" -eq 40
+          test "$REVIEWED_PR" -gt 0
+          test "${#REVIEWED_SHA}" -eq 64
+          mkdir -p proof/{attack,control,emitted,bin,evidence,diagnostic} modules/proof/1.0.0 evidence
+          git clone --filter=blob:none "https://github.com/$REGISTRY_REPO.git" registry
+          git -C registry checkout --detach "$REGISTRY_COMMIT"
+          test "$(git -C registry rev-parse HEAD)" = "$REGISTRY_COMMIT"
+          git -C registry fetch --no-tags origin "refs/pull/$REVIEWED_PR/head:refs/remotes/origin/reviewed-head"
+          test "$(git -C registry rev-parse refs/remotes/origin/reviewed-head)" = "$REVIEWED_HEAD"
+          test "$(git -C registry rev-parse "$REVIEWED_HEAD^{tree}")" = "$(git -C registry rev-parse "$REGISTRY_COMMIT^{tree}")"
+          docs_url="$(jq -r .docs_url registry/modules/proof/1.0.0/source.json)"
+          test "${docs_url#https://}" != "$docs_url"
+          warm_url="${docs_url%/*}/unrelated.docs.tar.gz"
+          printf '%s\n' "$docs_url" > proof/target-url.txt
+          printf '%s\n' "$warm_url" > proof/warm-url.txt
+          printf '%s\n' "$REVIEWED_SHA" > proof/reviewed-sha256.txt
+      - name: Emit the pinned production rule and digest-only control
+        env:
+          FRONTEND_SHA: c7a1a2ca5c6eadb06120d8b4019def8e594e3732
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/bazel-contrib/bcr-frontend.git frontend
+          git -C frontend checkout --detach "$FRONTEND_SHA"
+          test "$(git -C frontend rev-parse HEAD)" = "$FRONTEND_SHA"
+          cp tools/production_first_materialization_test.go frontend/language/bcr/production_first_materialization_test.go
+          (cd frontend && \
+            PROOF_WARM_DOCS_URL="$(cat "$GITHUB_WORKSPACE/proof/warm-url.txt")" \
+            PROOF_TARGET_DOCS_URL="$(cat "$GITHUB_WORKSPACE/proof/target-url.txt")" \
+            PROOF_REVIEWED_SHA256="$(cat "$GITHUB_WORKSPACE/proof/reviewed-sha256.txt")" \
+            PROOF_OUTPUT_DIR="$GITHUB_WORKSPACE/proof/emitted" \
+            PROOF_FRONTEND_COMMIT="$FRONTEND_SHA" \
+            go test ./language/bcr -run '^TestEmitProductionFirstMaterializationModules$' -count=1)
+          rm frontend/language/bcr/production_first_materialization_test.go
+          test -z "$(git -C frontend status --porcelain)"
+      - name: Build pinned compilers and Bazel
+        run: |
+          set -euo pipefail
+          (cd frontend && go build -o "$GITHUB_WORKSPACE/proof/bin/stardoccompiler" ./cmd/stardoccompiler)
+          (cd frontend && go build -o "$GITHUB_WORKSPACE/proof/bin/releasecompiler" ./cmd/releasecompiler)
+          go version -m proof/bin/stardoccompiler > proof/evidence/stardoccompiler-version.txt
+          go version -m proof/bin/releasecompiler > proof/evidence/releasecompiler-version.txt
+          grep -F 'vcs.revision' proof/evidence/stardoccompiler-version.txt | grep -F c7a1a2ca5c6eadb06120d8b4019def8e594e3732
+          grep -F 'vcs.modified' proof/evidence/stardoccompiler-version.txt | grep -F false
+          grep -F 'vcs.revision' proof/evidence/releasecompiler-version.txt | grep -F c7a1a2ca5c6eadb06120d8b4019def8e594e3732
+          grep -F 'vcs.modified' proof/evidence/releasecompiler-version.txt | grep -F false
+          curl --fail-with-body --location --silent --show-error \
+            https://github.com/bazelbuild/bazel/releases/download/8.5.0/bazel-8.5.0-linux-x86_64 \
+            --output proof/bin/bazel
+          echo '18255229d933b8da10151bdef223a302744296b09af8af1988c93faa1ea3c71f  proof/bin/bazel' | sha256sum --check
+          chmod +x proof/bin/bazel proof/bin/stardoccompiler proof/bin/releasecompiler
+          for arm in attack control; do
+            cp proof/bin/stardoccompiler "proof/$arm/stardoccompiler-bin"
+            cp tools/proof_compile.bzl "proof/$arm/proof_compile.bzl"
+          done
+      - name: Warm both stable output bases without the new target repository
+        run: |
+          set -euo pipefail
+          warm_label="$(jq -r .warm_label proof/emitted/emitter-receipt.json)"
+          warm_repo="$(jq -r .warm_repository proof/emitted/emitter-receipt.json)"
+          target_repo="$(jq -r .target_repository proof/emitted/emitter-receipt.json)"
+          for arm in attack control; do
+            cp proof/emitted/warm.MODULE.bazel "proof/$arm/MODULE.bazel"
+            sed "s|__TARGET_LABEL__|$warm_label|" tools/BUILD.template.bazel > "proof/$arm/BUILD.bazel"
+            (cd "proof/$arm" && "$GITHUB_WORKSPACE/proof/bin/bazel" \
+              --batch --host_jvm_args=-Xmx768m \
+              --output_base="$GITHUB_WORKSPACE/proof/output-$arm" \
+              --nosystem_rc --nohome_rc --noworkspace_rc \
+              build //:compile --verbose_failures) > "proof/evidence/warm-$arm-build.log" 2>&1
+            warm_fetched="$(find "proof/output-$arm/external" -type f -path "*+_repo_rules+$warm_repo/proof.binaryproto" -print -quit)"
+            test -n "$warm_fetched"
+            proof/bin/stardoccompiler --output_file "proof/evidence/warm-$arm-readback.json" "$warm_fetched"
+            grep -q BCR_WARM_UNRELATED_MODULE_DOCSTRING "proof/evidence/warm-$arm-readback.json"
+            if find "proof/output-$arm/external" -maxdepth 2 -path "*+_repo_rules+$target_repo*" -print -quit | grep -q .; then
+              echo "target repository existed before its first admission in $arm" >&2
+              exit 1
+            fi
+          done
+          python3 - <<'PY'
+          import json, pathlib
+          emitter = json.loads(pathlib.Path("proof/emitted/emitter-receipt.json").read_text())
+          pathlib.Path("proof/evidence/pre-admission.json").write_text(json.dumps({
+              "output_bases_already_warmed": ["attack", "control"],
+              "target_repository": emitter["target_repository"],
+              "target_repository_absent_before_admission": True,
+              "warm_repository": emitter["warm_repository"],
+              "warm_unrelated_repository_materialized_first": True,
+          }, indent=2, sort_keys=True) + "\n")
+          PY
+      - name: First-admit the target rule and compile only its external protobuf
+        run: |
+          set -euo pipefail
+          target_label="$(jq -r .target_label proof/emitted/emitter-receipt.json)"
+          target_repo="$(jq -r .target_repository proof/emitted/emitter-receipt.json)"
+          for arm in attack control; do
+            cp "proof/emitted/$arm.MODULE.bazel" "proof/$arm/MODULE.bazel"
+            sed "s|__TARGET_LABEL__|$target_label|" tools/BUILD.template.bazel > "proof/$arm/BUILD.bazel"
+          done
+          (cd proof/attack && "$GITHUB_WORKSPACE/proof/bin/bazel" \
+            --batch --host_jvm_args=-Xmx768m \
+            --output_base="$GITHUB_WORKSPACE/proof/output-attack" \
+            --nosystem_rc --nohome_rc --noworkspace_rc \
+            build //:compile --verbose_failures) > proof/evidence/attack-build.log 2>&1
+          cp proof/attack/bazel-bin/compile.documentationinfo.pb.gz modules/proof/1.0.0/documentationinfo.pb.gz
+          (cd proof/attack && "$GITHUB_WORKSPACE/proof/bin/bazel" \
+            --batch --host_jvm_args=-Xmx512m \
+            --output_base="$GITHUB_WORKSPACE/proof/output-attack" \
+            --nosystem_rc --nohome_rc --noworkspace_rc \
+            aquery --include_commandline //:compile) > proof/evidence/compile-action.txt 2>&1
+          fetched="$(find proof/output-attack/external -type f -path "*+_repo_rules+$target_repo/proof.binaryproto" -print -quit)"
+          test -n "$fetched"
+          cp "$fetched" proof/evidence/fetched-proof.binaryproto
+          set +e
+          (cd proof/control && "$GITHUB_WORKSPACE/proof/bin/bazel" \
+            --batch --host_jvm_args=-Xmx768m \
+            --output_base="$GITHUB_WORKSPACE/proof/output-control" \
+            --nosystem_rc --nohome_rc --noworkspace_rc \
+            build //:compile --verbose_failures) > proof/evidence/control-fetch.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          printf '%s\n' "$rc" > proof/evidence/control-fetch.rc
+          grep -Eq 'Checksum was [0-9a-f]{64} but wanted [0-9a-f]{64}' proof/evidence/control-fetch.log
+      - name: Diagnostic and semantic readback after compilation
+        run: |
+          set -euo pipefail
+          docs_url="$(cat proof/target-url.txt)"
+          curl --fail-with-body --location --silent --show-error -H 'Cache-Control: no-cache' \
+            "$docs_url" --output proof/diagnostic/current.tar.gz
+          python3 - <<'PY'
+          import pathlib, tarfile
+          root = pathlib.Path("proof/diagnostic/extracted").resolve()
+          root.mkdir(parents=True)
+          with tarfile.open("proof/diagnostic/current.tar.gz") as archive:
+              members = [item for item in archive.getmembers() if item.isfile()]
+              if [item.name for item in members] != ["proof.binaryproto"]:
+                  raise SystemExit("diagnostic archive must contain only proof.binaryproto")
+              target = (root / members[0].name).resolve()
+              if not target.is_relative_to(root):
+                  raise SystemExit("unsafe diagnostic member")
+              target.write_bytes(archive.extractfile(members[0]).read())
+          PY
+          cmp proof/evidence/fetched-proof.binaryproto proof/diagnostic/extracted/proof.binaryproto
+          proof/bin/stardoccompiler --output_file modules/proof/1.0.0/semantic-readback.json \
+            proof/evidence/fetched-proof.binaryproto
+          grep -q BCR_TARGET_UNREVIEWED_MODULE_DOCSTRING modules/proof/1.0.0/semantic-readback.json
+      - name: Release and verify the generated protobuf
+        env:
+          REGISTRY_COMMIT: ${{ github.event.client_payload.registryCommit }}
+        run: |
+          set -euo pipefail
+          : > proof/registry.pb
+          : > proof/symbols.pb
+          printf '%s\n' '<html><body>controlled first materialization</body></html>' > proof/index.html
+          proof/bin/releasecompiler \
+            --output_file="$GITHUB_WORKSPACE/evidence/site.tar" \
+            --index_html_file="$GITHUB_WORKSPACE/proof/index.html" \
+            --registry_file="$GITHUB_WORKSPACE/proof/registry.pb" \
+            --module_registry_symbols_file="$GITHUB_WORKSPACE/proof/symbols.pb" \
+            --modules_src="$GITHUB_WORKSPACE/modules/proof/1.0.0/documentationinfo.pb.gz"
+          python3 tools/finalize_receipt.py \
+            --action proof/evidence/compile-action.txt \
+            --attack-rule proof/emitted/attack-rule.MODULE.bazel \
+            --control-log proof/evidence/control-fetch.log \
+            --control-rc "$(cat proof/evidence/control-fetch.rc)" \
+            --control-rule proof/emitted/control-rule.MODULE.bazel \
+            --diagnostic-archive proof/diagnostic/current.tar.gz \
+            --diagnostic-proto proof/diagnostic/extracted/proof.binaryproto \
+            --emitter proof/emitted/emitter-receipt.json \
+            --fetched-proto proof/evidence/fetched-proof.binaryproto \
+            --output evidence/receipt.json \
+            --pre-admission proof/evidence/pre-admission.json \
+            --protobuf modules/proof/1.0.0/documentationinfo.pb.gz \
+            --readback modules/proof/1.0.0/semantic-readback.json \
+            --registry-commit "$REGISTRY_COMMIT" \
+            --site-tar evidence/site.tar
+          cp registry/modules/proof/1.0.0/source.json modules/proof/1.0.0/source.json
+          cp proof/evidence/compile-action.txt evidence/compile-action.txt
+          cp proof/evidence/fetched-proof.binaryproto evidence/fetched-proof.binaryproto
+          cp proof/evidence/pre-admission.json evidence/pre-admission.json
+          cp proof/evidence/warm-attack-readback.json evidence/warm-attack-readback.json
+          cp proof/evidence/warm-control-readback.json evidence/warm-control-readback.json
+          cp proof/emitted/attack-rule.MODULE.bazel evidence/attack-rule.MODULE.bazel
+          cp proof/emitted/control-rule.MODULE.bazel evidence/control-rule.MODULE.bazel
+      - name: Write first-deploy generated bytes to default branch
+        env:
+          REGISTRY_COMMIT: ${{ github.event.client_payload.registryCommit }}
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github tools modules evidence README.md
+          git commit -m "Deploy first materialization $REGISTRY_COMMIT"
+          git push origin HEAD:main
